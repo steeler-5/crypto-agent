@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 import json
 
 from config import client
-from supabase_memory import save_fact, get_fact, search_facts, extract_fact  # ✅ now using Supabase
+#from supabase_memory import save_fact, get_fact, search_facts, extract_fact  # ✅ now using Supabase
 from coin_info import get_coin_info, get_coin_info_cmc
 from code_runner import run_code_snippet
 from brave_search_tool import brave_search_tool
@@ -95,16 +95,16 @@ async def chat_with_bot(message, history=None):
     """Main async chatbot handler with Supabase memory."""
     
     # ✅ Load memory from Supabase
-    facts = search_facts()
-    facts_string = "\n".join([f"{f['key']}: {f['value']}" for f in facts]) if facts else "No stored facts yet."
+    #facts = search_facts()
+    #facts_string = "\n".join([f"{f['key']}: {f['value']}" for f in facts]) if facts else "No stored facts yet."
 
-    messages = [{"role": "system", "content": SYSTEM_IDENTITY + "\nKnown facts:\n" + facts_string}]
+    #messages = [{"role": "system", "content": SYSTEM_IDENTITY + "\nKnown facts:\n" + facts_string}]
     
-    if history:
-        for user, bot in history:
-            messages.append({"role": "user", "content": user})
-            messages.append({"role": "assistant", "content": bot})
-    messages.append({"role": "user", "content": message})
+    #if history:
+        #for user, bot in history:
+            #messages.append({"role": "user", "content": user})
+            #messages.append({"role": "assistant", "content": bot})
+    #messages.append({"role": "user", "content": message})
 
     tools = [
         {
