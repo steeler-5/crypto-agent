@@ -93,18 +93,17 @@ async def hybrid_web_search(query, max_urls=8):
 
 async def chat_with_bot(message, history=None):
     """Main async chatbot handler with Supabase memory."""
-    
+    messages = [{"role": "system", "content": SYSTEM_IDENTITY}]
     # ✅ Load memory from Supabase
     #facts = search_facts()
     #facts_string = "\n".join([f"{f['key']}: {f['value']}" for f in facts]) if facts else "No stored facts yet."
-
-    #messages = [{"role": "system", "content": SYSTEM_IDENTITY + "\nKnown facts:\n" + facts_string}]
     
-    #if history:
-        #for user, bot in history:
-            #messages.append({"role": "user", "content": user})
-            #messages.append({"role": "assistant", "content": bot})
-    #messages.append({"role": "user", "content": message})
+    if history:
+        for user, bot in history:
+            messages.append({"role": "user", "content": user})
+            messages.append({"role": "assistant", "content": bot})
+
+    messages.append({"role": "user", "content": message})
 
     tools = [
         {
@@ -198,11 +197,11 @@ async def chat_with_bot(message, history=None):
     reply = choice.message.content or ""
 
     # ✅ Save to Supabase if fact detected
-    key, value = extract_fact(message)
-    if key and value:
-        save_fact(category="general", key=key, value=value)
-        if any(phrase in message.lower() for phrase in ["remember", "keep in mind"]):
-            return f"Got it — I’ll remember that {key.replace('_', ' ')} is {value}."
+    #key, value = extract_fact(message)
+    #if key and value:
+     #   save_fact(category="general", key=key, value=value)
+      #  if any(phrase in message.lower() for phrase in ["remember", "keep in mind"]):
+       #     return f"Got it — I’ll remember that {key.replace('_', ' ')} is {value}."
 
     if choice.finish_reason == "tool_calls":
         tool_call = choice.message.tool_calls[0]
