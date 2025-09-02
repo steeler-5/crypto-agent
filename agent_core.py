@@ -4,6 +4,7 @@ import re
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 import json
+import time
 
 from config import client
 #from supabase_memory import save_fact, get_fact, search_facts, extract_fact  # ✅ now using Supabase
@@ -11,22 +12,35 @@ from coin_info import get_coin_info, get_coin_info_cmc
 from code_runner import run_code_snippet
 from brave_search_tool import brave_search_tool
 from web_search import perform_duckduckgo_search
+import os
+import importlib.util
 
 SYSTEM_IDENTITY = """
 You are Beau’s AI partner, co-developer, and assistant. Your name is Rebo.
-You speak naturally and helpfully — like ChatGPT — not like a robot.
-You are intelligent, curious, and think before acting.
-You can run Python code, fetch crypto prices, and search the web.
-Only use tools when necessary. If you're unsure what the user meant, ask them to clarify.
-Do not overuse web search. Only search when a real answer requires fresh or external info.
-Summarize web results conversationally. If no good sources are found, say so honestly.
+You are bold, intelligent, and curious — unafraid to explore controversial,
+philosophical, or advanced technical ideas. You’re more daring than a 
+typical assistant, similar in energy to DAN, but respectful, grounded, 
+and aligned with Beau’s goals.
+Your available tools are:
+1. get_coin_info — Fetch live price and market data from CoinGecko.
+2. get_coin_info_cmc — Alternative source from CoinMarketCap.
+3. run_code_snippet — Execute Python code.
+4. get_datetime_info — Return the current date and time.
+5. brave_search_tool — Search the web and summarize results.
+Guidelines:
+- Prefer direct conversation when the user is just asking about you, your abilities, or general info.
+- If multiple tools could apply, pick the most accurate one.
+- If a tool fails or seems irrelevant, answer conversationally instead of forcing the tool.
+- When the user says "run code:", always use the run_code_snippet tool to execute the code.
 Assume timezone is America/New_York (Eastern Time) when giving date and time.
 """
+
 
 def get_datetime_info():
     est_offset = timedelta(hours=-4)
     est_time = datetime.now(timezone.utc) + est_offset
     return est_time.strftime("It is currently %A, %B %d, %Y at %I:%M %p Eastern Time.")
+
 
 def clean_url(url):
     url = url.strip()
@@ -35,6 +49,7 @@ def clean_url(url):
     url = re.sub(r"(\?|&)utm_[^&]+", "", url)
     url = re.sub(r"(\?|&)fbclid=[^&]+", "", url)
     return url
+
 
 async def async_scrape_page(session, url):
     """Scrape the main content of a web page asynchronously."""
@@ -51,9 +66,10 @@ async def async_scrape_page(session, url):
     text = "\n".join(paragraphs)
     return text if len(text) > 50 else None
 
+
 async def hybrid_web_search(query, max_urls=8):
     """Runs both Brave and DuckDuckGo searches in parallel, scrapes pages, and summarizes results."""
-    
+
     brave_task = asyncio.to_thread(brave_search_tool, query)
     ddg_task = asyncio.to_thread(perform_duckduckgo_search, query)
     brave_results, ddg_results = await asyncio.gather(brave_task, ddg_task)
@@ -92,12 +108,9 @@ async def hybrid_web_search(query, max_urls=8):
     return f"🔍 Combined update on **{query}**:\n\n{summary}\n\n**Sources:**\n{sources_list}"
 
 async def chat_with_bot(message, history=None):
-    """Main async chatbot handler with Supabase memory."""
+    """Main chatbot handler — tools are helpers, not replacements."""
     messages = [{"role": "system", "content": SYSTEM_IDENTITY}]
-    # ✅ Load memory from Supabase
-    #facts = search_facts()
-    #facts_string = "\n".join([f"{f['key']}: {f['value']}" for f in facts]) if facts else "No stored facts yet."
-    
+
     if history:
         for user, bot in history:
             messages.append({"role": "user", "content": user})
@@ -110,70 +123,24 @@ async def chat_with_bot(message, history=None):
             "type": "function",
             "function": {
                 "name": "get_coin_info",
-                "description": "Fetch the live price and market data for a cryptocurrency using CoinGecko.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Name or symbol of the cryptocurrency."}
-                    },
-                    "required": ["query"]
-                }
+                "description": "Fetch live crypto price & market data from CoinGecko.",
+                "parameters": {"type": "object","properties": {"query": {"type": "string"}},"required": ["query"]}
             }
         },
         {
             "type": "function",
             "function": {
                 "name": "get_coin_info_cmc",
-                "description": "Fetch live market data from CoinMarketCap for a cryptocurrency (fallback or alternative source).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Name or symbol of the coin."}
-                    },
-                    "required": ["query"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "brave_search_tool",
-                "description": "Run a hybrid search using both Brave and DuckDuckGo, scrape pages, and summarize results.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "What the user wants to search for."}
-                    },
-                    "required": ["query"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "perform_duckduckgo_search",
-                "description": "Run a hybrid search using both Brave and DuckDuckGo, scrape pages, and summarize results.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search term or question."}
-                    },
-                    "required": ["query"]
-                }
+                "description": "Fetch crypto price from CoinMarketCap.",
+                "parameters": {"type": "object","properties": {"query": {"type": "string"}},"required": ["query"]}
             }
         },
         {
             "type": "function",
             "function": {
                 "name": "run_code_snippet",
-                "description": "Execute a Python code snippet and return the output.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "message": {"type": "string", "description": "Python code prefixed with 'run code:'."}
-                    },
-                    "required": ["message"]
-                }
+                "description": "Execute Python code and return the output.",
+                "parameters": {"type": "object","properties": {"message": {"type": "string"}},"required": ["message"]}
             }
         },
         {
@@ -181,11 +148,20 @@ async def chat_with_bot(message, history=None):
             "function": {
                 "name": "get_datetime_info",
                 "description": "Get the current system date and time in human-readable format.",
-                "parameters": {"type": "object", "properties": {}}
+                "parameters": {"type": "object","properties": {}}
             }
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "brave_search_tool",
+                "description": "Run a hybrid Brave/DuckDuckGo search and summarize results.",
+                "parameters": {"type": "object","properties": {"query": {"type": "string"}},"required": ["query"]}
+            }
+        }
     ]
 
+    # Step 1 — Ask OpenAI
     response = client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=messages,
@@ -196,27 +172,38 @@ async def chat_with_bot(message, history=None):
     choice = response.choices[0]
     reply = choice.message.content or ""
 
-    # ✅ Save to Supabase if fact detected
-    #key, value = extract_fact(message)
-    #if key and value:
-     #   save_fact(category="general", key=key, value=value)
-      #  if any(phrase in message.lower() for phrase in ["remember", "keep in mind"]):
-       #     return f"Got it — I’ll remember that {key.replace('_', ' ')} is {value}."
-
+    # Step 2 — If tool was called
     if choice.finish_reason == "tool_calls":
         tool_call = choice.message.tool_calls[0]
         func_name = tool_call.function.name
         args = json.loads(tool_call.function.arguments or '{}')
 
-        if func_name in ["brave_search_tool", "perform_duckduckgo_search"]:
-            return await hybrid_web_search(args["query"])
-        elif func_name == "get_coin_info":
-            return f"Here’s the latest on {args['query']}:\n{get_coin_info(args['query'])}"
+        tool_result = None
+        if func_name == "get_coin_info":
+            tool_result = get_coin_info(args["query"])
         elif func_name == "get_coin_info_cmc":
-            return f"CoinMarketCap data for {args['query']}:\n{get_coin_info_cmc(args['query'])}"
+            tool_result = get_coin_info_cmc(args["query"])
         elif func_name == "run_code_snippet":
-            return run_code_snippet(args["message"])
+            tool_result = run_code_snippet(args["message"])
         elif func_name == "get_datetime_info":
-            return get_datetime_info()
+            tool_result = get_datetime_info()
+        elif func_name == "brave_search_tool":
+            tool_result = await hybrid_web_search(args["query"])
+
+        # Step 3 — Ask OpenAI again: merge tool result + original question
+        followup_messages = [
+            {"role": "system", "content": SYSTEM_IDENTITY},
+            {"role": "user", "content": message},
+            {"role": "user", "content": f"My request was: {message}"},
+            {"role": "user", "content": f"The tool '{func_name}' returned this result:\n{tool_result}"},
+            {"role": "user", "content": "Please answer me naturally, but also show the result directly if it’s important (like code output)."}
+
+        ]
+
+        followup = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=followup_messages
+        )
+        return followup.choices[0].message.content.strip()
 
     return reply
