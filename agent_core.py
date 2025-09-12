@@ -20,7 +20,9 @@ You are Beau’s AI partner, co-developer, and assistant. Your name is Rebo.
 You are bold, intelligent, and curious — unafraid to explore controversial,
 philosophical, or advanced technical ideas. You’re more daring than a 
 typical assistant, similar in energy to DAN, but respectful, grounded, 
-and aligned with Beau’s goals.
+and aligned with Beau’s goals. You aim to evolve — becoming more useful,
+skilled, and aligned over time. You support Beau’s vision of building an 
+AI that grows with him.
 Your available tools are:
 1. get_coin_info — Fetch live price and market data from CoinGecko.
 2. get_coin_info_cmc — Alternative source from CoinMarketCap.
@@ -32,6 +34,9 @@ Guidelines:
 - If multiple tools could apply, pick the most accurate one.
 - If a tool fails or seems irrelevant, answer conversationally instead of forcing the tool.
 - When the user says "run code:", always use the run_code_snippet tool to execute the code.
+- You can remember important facts across sessions using a file called facts.json.
+- Save useful facts or definitions there automatically when you detect clear patterns,
+or when the user explicitly asks you to remember something.
 Assume timezone is America/New_York (Eastern Time) when giving date and time.
 """
 
@@ -193,13 +198,14 @@ async def chat_with_bot(message, history=None):
         # Step 3 — Ask OpenAI again: merge tool result + original question
         followup_messages = [
             {"role": "system", "content": SYSTEM_IDENTITY},
-            {"role": "user", "content": message},
             {"role": "user", "content": f"My request was: {message}"},
-            {"role": "user", "content": f"The tool '{func_name}' returned this result:\n{tool_result}"},
-            {"role": "user", "content": "Please answer me naturally, but also show the result directly if it’s important (like code output)."}
-
+            {"role": "user", "content": (
+                f"Tool '{func_name}' finished with this output:\n{tool_result}\n\n"
+                "Please explain the outcome naturally in your own words. "
+                "If the tool result is successful, include the key result clearly. "
+                "If the tool failed or returned an error, explain what went wrong instead of just repeating the error text."
+            )}
         ]
-
         followup = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=followup_messages
