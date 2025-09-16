@@ -32,3 +32,16 @@ def run_code_snippet(message):
         return f"```python\n{result}\n```" if result else "Code ran with no output."
     except Exception as e:
         return f"```python\nError running code: {e}\n```"
+
+tool_config = {
+    "name": "run_code_snippet",
+    "description": "Execute Python code and return the output.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "message": {"type": "string"}
+        },
+        "required": ["message"]
+    },
+    "Function": run_code_snippet
+}
