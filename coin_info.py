@@ -1,10 +1,9 @@
+# tools/coin_info.py
 import requests
-import os
 from config import CMC_API_KEY
 
 def get_coin_info(symbol_or_name):
     base_url = "https://api.coingecko.com/api/v3"
-
     overrides = {
         "xrp": "ripple",
         "wbtc": "wrapped-bitcoin",
@@ -40,14 +39,8 @@ def get_coin_info(symbol_or_name):
 
 def get_coin_info_cmc(symbol_or_name):
     url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
-    headers = {
-        'X-CMC_PRO_API_KEY': CMC_API_KEY
-    }
-    params = {
-        'start': '1',
-        'limit': '5000',
-        'convert': 'USD'
-    }
+    headers = {'X-CMC_PRO_API_KEY': CMC_API_KEY}
+    params = {'start': '1', 'limit': '5000', 'convert': 'USD'}
     r = requests.get(url, headers=headers, params=params)
     if r.status_code != 200:
         return "Failed to fetch from CoinMarketCap."
@@ -57,3 +50,31 @@ def get_coin_info_cmc(symbol_or_name):
             return f"{coin['name']} ({coin['symbol']}) is trading at ${coin['quote']['USD']['price']:.4f}, market cap ${coin['quote']['USD']['market_cap']:,}, 24h volume ${coin['quote']['USD']['volume_24h']:,}."
 
     return f"Coin '{symbol_or_name}' not found on CoinMarketCap."
+
+# Metadata for dynamic agent loading
+tool_config = [
+    {
+        "name": "get_coin_info",
+        "description": "Fetch live crypto price & market data from CoinGecko.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"}
+            },
+            "required": ["query"]
+        },
+        "function": lambda query: get_coin_info(query)
+    },
+    {
+        "name": "get_coin_info_cmc",
+        "description": "Fetch live crypto price & volume data from CoinMarketCap.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"}
+            },
+            "required": ["query"]
+        },
+        "function": lambda query: get_coin_info_cmc(query)
+    }
+]
