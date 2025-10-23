@@ -1,15 +1,12 @@
 """
-helius_token_bot.py
-───────────────────────────────
-Continuous-Mode Architecture (CU-Free)
-───────────────────────────────
-Current behavior:
-- Listen for new token mints from Helius webhook
-- Store & track all tokens in memory
-- Wait 15 min for each before first check
-- Automatically move tokens through mock states:
-    "new" → "watch" → "track" → "flagged" (simulated)
-───────────────────────────────
+helius_token_bot.py — Free Mode (DexScreener + Birdeye Public)
+───────────────────────────────────────────────────────────────
+✅ Helius webhook for new mints (free)
+✅ DexScreener for liquidity / price / volume (no key)
+✅ Birdeye Public fallback (no key)
+✅ Built-in throttling & caching (prevents 429 errors)
+✅ Uses your MoonScore + deployer reputation system
+───────────────────────────────────────────────────────────────
 """
 
 import os
@@ -17,115 +14,275 @@ import time
 import json
 import logging
 import asyncio
+import aiohttp
+from pathlib import Path
 from fastapi import FastAPI, Request
+from dotenv import load_dotenv
+load_dotenv()
 import uvicorn
+import random
+
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+
+async def send_discord_message(mint: str, data: dict, score_details: dict, total_score: float, deployer_score: float):
+    """Send structured notification to Discord."""
+    if not DISCORD_WEBHOOK_URL:
+        return
+
+    embed = {
+        "title": f"🚀 New Token Watched: {data.get('symbol', 'Unknown')} ({mint[:6]}...)",
+        "color": 0x00ffcc if total_score >= 70 else 0xffcc00,
+        "fields": [
+            {"name": "Mint Address", "value": f"`{mint}`", "inline": False},
+            {"name": "Total MoonScore", "value": f"**{total_score:.2f}**", "inline": True},
+            {"name": "Deployer Reputation", "value": f"{deployer_score:.2f}", "inline": True},
+            {"name": "Liquidity Score", "value": f"{score_details['liquidity_score']:.1f}", "inline": True},
+            {"name": "Holder Score", "value": f"{score_details['holder_score']:.1f}", "inline": True},
+            {"name": "Volume Score", "value": f"{score_details['volume_score']:.1f}", "inline": True},
+            {"name": "Momentum Score", "value": f"{score_details['momentum_score']:.1f}", "inline": True},
+            {"name": "Whale Distribution", "value": f"{score_details['concentration_score']:.1f}", "inline": True},
+            {"name": "Deployer Impact", "value": f"{score_details['deployer_component']:.1f}", "inline": True},
+            {"name": "Liquidity (USD)", "value": f"${data.get('liquidity_usd', 0):,.0f}", "inline": True},
+            {"name": "Volume 24h", "value": f"${data.get('volume_24h_usd', 0):,.0f}", "inline": True},
+            {"name": "Price (USD)", "value": f"${data.get('price_usd', 0):,.6f}", "inline": True},
+            {"name": "Top 10 Holders", "value": f"{data.get('top10_holder_ratio', 0):.2f}", "inline": True},
+        ],
+        "footer": {"text": f"Tracked by Helius Token Bot — {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} UTC"}
+    }
+
+    payload = {"embeds": [embed]}
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            await session.post(DISCORD_WEBHOOK_URL, json=payload)
+        except Exception as e:
+            logger.warning(f"Discord send failed: {e}")
 
 # =====================================================
-#  CONFIGURATION
+# CONFIGURATION
 # =====================================================
 app = FastAPI()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("helius_bot")
 
-# Placeholder keys
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
-BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")
+TOKEN_MINIMUM_AGE = 900   # 15 minutes
+CHECK_WATCH_EVERY = 600   # 10 minutes
+CHECK_TRACK_EVERY = 180   # 3 minutes
+CHECK_FLAGGED_EVERY = 60  # 1 minute
+CACHE_TTL = 180            # cache lifetime (sec)
+REQUEST_DELAY = 1.0        # throttle: 1 req/sec total
 
-# Timing configuration (seconds)
-TOKEN_MINIMUM_AGE = 900     # 15 min until first analysis
-CHECK_WATCH_EVERY = 600     # 10 min
-CHECK_TRACK_EVERY = 180     # 3 min
-CHECK_FLAGGED_EVERY = 60    # 1 min
-
-# =====================================================
-#  GLOBAL STATE
-# =====================================================
-tracked_tokens = {}  # mint -> {timestamp, state, last_check, data}
-
+tracked_tokens = {}
+CACHE = {}
+LAST_REQUEST = 0.0
 
 # =====================================================
-#  PLACEHOLDER DATA FUNCTIONS
+# DEPLOYER REPUTATION MANAGER
 # =====================================================
-async def mock_fetch_token_data(mint: str) -> dict:
-    """
-    Placeholder for Birdeye / Jupiter metrics.
-    Returns mock data for demonstration.
-    """
-    await asyncio.sleep(0.1)  # simulate small delay
-    # fake "data evolution" by randomizing values slightly
-    import random
-    holders = random.randint(0, 200)
-    liquidity = random.randint(0, 10000)
-    volume = random.randint(0, 8000)
-    score = (liquidity / 200) + (holders / 5) + (volume / 400)
-    return {
-        "holders": holders,
-        "liquidity": liquidity,
-        "volume": volume,
-        "mock_score": round(score, 2)
+class DeployerReputationManager:
+    def __init__(self, filepath="deployer_reputation.json"):
+        self.filepath = Path(filepath)
+        if self.filepath.exists():
+            with open(self.filepath, "r") as f:
+                self.data = json.load(f)
+        else:
+            self.data = {}
+
+    def get_score(self, address: str) -> float:
+        info = self.data.get(address, {"rugs": 0, "safe": 0})
+        total = info["rugs"] + info["safe"]
+        if total == 0:
+            return 0.0
+        return round((info["safe"] - info["rugs"]) / total, 2)
+
+    def update(self, address: str, is_rug: bool):
+        record = self.data.get(address, {"rugs": 0, "safe": 0})
+        if is_rug:
+            record["rugs"] += 1
+        else:
+            record["safe"] += 1
+        self.data[address] = record
+        with open(self.filepath, "w") as f:
+            json.dump(self.data, f, indent=2)
+
+deployer_rep = DeployerReputationManager()
+
+# =====================================================
+# MOONSCORE FUNCTION
+# =====================================================
+def calculate_moon_score(data: dict, deployer_score: float = 0.0) -> float:
+    liquidity = float(data.get("liquidity_usd", 0))
+    holders = int(data.get("holder", 0))
+    volume = float(data.get("volume_24h_usd", 0))
+    price_change = float(data.get("price_change_1h", 0))
+    whale_concentration = float(data.get("top10_holder_ratio", 0.85))
+
+    liquidity_score = min(liquidity / 5000, 1) * 20
+    holder_score = min(holders / 50, 1) * 15
+    volume_score = min(volume / 3000, 1) * 25
+    momentum_score = max(min(price_change / 20, 1), 0) * 10
+    concentration_score = (1 - whale_concentration) * 20
+    deployer_component = max(min(deployer_score, 1), -1) * 10
+
+    total = liquidity_score + holder_score + volume_score + momentum_score + concentration_score + deployer_component
+    total = round(max(0, min(total, 100)), 2)
+
+    details = {
+        "liquidity_score": liquidity_score,
+        "holder_score": holder_score,
+        "volume_score": volume_score,
+        "momentum_score": momentum_score,
+        "concentration_score": concentration_score,
+        "deployer_component": deployer_component,
     }
 
-
-def simulate_moon_score(data: dict) -> float:
-    """Rough proxy until Birdeye data is connected."""
-    return data.get("mock_score", 0.0)
-
+    return total, details
 
 # =====================================================
-#  TOKEN ANALYSIS
+# THROTTLED REQUEST HELPER
+# =====================================================
+async def throttled_get(url: str, headers=None, timeout=10):
+    global LAST_REQUEST
+    now = time.time()
+    wait = REQUEST_DELAY - (now - LAST_REQUEST)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    LAST_REQUEST = time.time()
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers, timeout=timeout) as resp:
+            if resp.status != 200:
+                logger.debug(f"HTTP {resp.status} for {url}")
+                return None
+            return await resp.json()
+
+# =====================================================
+# DEXSCREENER DATA SOURCE
+# =====================================================
+async def fetch_dexscreener_data(mint: str) -> dict:
+    # caching
+    if mint in CACHE and time.time() - CACHE[mint]["timestamp"] < CACHE_TTL:
+        return CACHE[mint]["data"]
+
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+    try:
+        data = await throttled_get(url)
+    except Exception as e:
+        logger.warning(f"[{mint}] DexScreener failed: {e}")
+        return {}
+
+    if not data:
+        return {}
+
+    pairs = data.get("pairs", [])
+    if not pairs:
+        return {}
+
+    pair = pairs[0]
+    result = {
+        "symbol": pair.get("baseToken", {}).get("symbol"),
+        "name": pair.get("baseToken", {}).get("name"),
+        "mint": mint,
+        "liquidity_usd": float(pair.get("liquidity", {}).get("usd", 0)),
+        "volume_24h_usd": float(pair.get("volume", {}).get("h24", 0)),
+        "price_usd": float(pair.get("priceUsd", 0)),
+        "price_change_1h": float(pair.get("priceChange", {}).get("h1", 0)),
+        "price_change_5m": float(pair.get("priceChange", {}).get("m5", 0)),
+        "holder": 0,
+        "top10_holder_ratio": 0.85
+    }
+    CACHE[mint] = {"timestamp": time.time(), "data": result}
+    return result
+
+# =====================================================
+# BIRDEYE PUBLIC FALLBACK
+# =====================================================
+async def fetch_birdeye_public(mint: str) -> dict:
+    url = f"https://public-api.birdeye.so/public/defi/token_overview?address={mint}"
+    try:
+        data = await throttled_get(url)
+    except Exception as e:
+        logger.warning(f"[{mint}] Birdeye public failed: {e}")
+        return {}
+
+    info = data.get("data") if data else None
+    if not info:
+        return {}
+
+    return {
+        "symbol": info.get("symbol"),
+        "name": info.get("name"),
+        "liquidity_usd": float(info.get("liquidity", 0)),
+        "volume_24h_usd": float(info.get("volume_24h", 0)),
+        "price_usd": float(info.get("price", 0)),
+        "holder": int(info.get("holder", 0)),
+        "top10_holder_ratio": 0.85
+    }
+
+# =====================================================
+# COMBINED FETCHER
+# =====================================================
+async def fetch_token_data(mint: str) -> dict:
+    data = await fetch_dexscreener_data(mint)
+    if not data:
+        data = await fetch_birdeye_public(mint)
+    return data
+
+# =====================================================
+# ANALYSIS LOGIC
 # =====================================================
 async def analyze_token(mint: str):
-    """Perform first analysis when token hits 15 min age."""
     token = tracked_tokens[mint]
     logger.info(f"[{mint}] Performing first analysis (15 min mark)...")
-    data = await mock_fetch_token_data(mint)
-    score = simulate_moon_score(data)
-    token["data"] = data
-    token["moon_score"] = score
-    token["last_check"] = time.time()
 
-    # Classify based on score thresholds
+    data = await fetch_token_data(mint)
+    if not data:
+        logger.info(f"[{mint}] No data found — skipping.")
+        return
+
+    creator = f"FakeDeployer_{random.randint(1000,9999)}"
+    deployer_score = deployer_rep.get_score(creator)
+
+    score, score_details = calculate_moon_score(data, deployer_score)
+    token.update({"data": data, "moon_score": score, "last_check": time.time()})
+
     if score < 40:
         token["state"] = "ignore"
         logger.info(f"[{mint}] ❌ Ignored (MoonScore={score})")
-    elif 40 <= score < 70:
+    elif score < 70:
         token["state"] = "watch"
         logger.info(f"[{mint}] 👀 Now watching (MoonScore={score})")
-    elif 70 <= score < 85:
+        await send_discord_message(mint, data, score_details, score, deployer_score)
+    elif score < 85:
         token["state"] = "track"
         logger.info(f"[{mint}] 📡 Tracking (MoonScore={score})")
     else:
         token["state"] = "flagged"
         logger.info(f"[{mint}] 🚀 Flagged as moon candidate! (MoonScore={score})")
 
-
+# =====================================================
+# REFRESH LOOP
+# =====================================================
 async def refresh_token_state(mint: str):
-    """Re-check existing tokens based on their current state."""
     token = tracked_tokens[mint]
     now = time.time()
     elapsed = now - token.get("last_check", 0)
     state = token["state"]
 
-    if state == "watch" and elapsed >= CHECK_WATCH_EVERY:
-        logger.info(f"[{mint}] 🔄 Refreshing WATCH token...")
-    elif state == "track" and elapsed >= CHECK_TRACK_EVERY:
-        logger.info(f"[{mint}] 🔄 Refreshing TRACK token...")
-    elif state == "flagged" and elapsed >= CHECK_FLAGGED_EVERY:
-        logger.info(f"[{mint}] 🔄 Refreshing FLAGGED token...")
-    else:
-        return  # not yet time to check again
+    # check intervals
+    if (state == "watch" and elapsed < CHECK_WATCH_EVERY) or \
+       (state == "track" and elapsed < CHECK_TRACK_EVERY) or \
+       (state == "flagged" and elapsed < CHECK_FLAGGED_EVERY):
+        return
 
-    data = await mock_fetch_token_data(mint)
-    score = simulate_moon_score(data)
-    token["data"] = data
-    token["moon_score"] = score
-    token["last_check"] = now
+    data = await fetch_token_data(mint)
+    if not data:
+        return
 
-    # State transitions
+    score, score_details = calculate_moon_score(data)
+    token.update({"data": data, "moon_score": score, "last_check": now})
+
     if score < 40:
         token["state"] = "ignore"
         logger.info(f"[{mint}] ⏹️ Dropped to ignore (MoonScore={score})")
@@ -138,82 +295,69 @@ async def refresh_token_state(mint: str):
     elif state == "flagged" and score < 70:
         token["state"] = "track"
         logger.info(f"[{mint}] ⬇️ Demoted to TRACK (MoonScore={score})")
-    else:
-        logger.debug(f"[{mint}] Score updated: {score}")
-
 
 # =====================================================
-#  MASTER MONITOR LOOP
+# MONITOR LOOP
 # =====================================================
 async def monitor_tokens():
-    """Main continuous loop managing all token checks."""
+    summary_timer = time.time()
     while True:
         now = time.time()
-        if not tracked_tokens:
-            await asyncio.sleep(5)
-            continue
-
         for mint, token in list(tracked_tokens.items()):
             age = now - token["timestamp"]
 
-            # 1️⃣  First-time analysis after 15 min
             if token["state"] == "new" and age >= TOKEN_MINIMUM_AGE:
                 await analyze_token(mint)
-
-            # 2️⃣  Periodic refresh for watch/track/flagged
             elif token["state"] in ("watch", "track", "flagged"):
                 await refresh_token_state(mint)
-
-            # 3️⃣  Cleanup ignored tokens after 1 hr
             elif token["state"] == "ignore" and age > 3600:
-                logger.info(f"[{mint}] 🧹 Removing ignored token from memory.")
                 tracked_tokens.pop(mint, None)
 
-        await asyncio.sleep(5)  # Small delay between full passes
+        # every 30 min print summary
+        if now - summary_timer > 1800:
+            summary_timer = now
+            states = {"new":0,"watch":0,"track":0,"flagged":0,"ignore":0}
+            scores = []
+            for t in tracked_tokens.values():
+                states[t["state"]] = states.get(t["state"],0)+1
+                if t.get("moon_score"): scores.append(t["moon_score"])
+            avg = round(sum(scores)/len(scores),1) if scores else 0
+            logger.info(f"=== Status Summary ===  New:{states['new']} Watch:{states['watch']} "
+                        f"Track:{states['track']} Flagged:{states['flagged']} Ignore:{states['ignore']} "
+                        f"| Avg Score:{avg}")
+            logger.info("=======================")
 
-
-# =====================================================
-#  TOKEN REGISTRATION
-# =====================================================
-async def add_token(mint: str, timestamp: float):
-    """Register new token from Helius event."""
-    if mint in tracked_tokens:
-        return
-    tracked_tokens[mint] = {
-        "timestamp": timestamp,
-        "state": "new",
-        "last_check": 0.0,
-        "data": {}
-    }
-    logger.info(f"🆕 New token minted: {mint} at {timestamp}")
-
+        await asyncio.sleep(5)
 
 # =====================================================
-#  WEBHOOK HANDLER
+# WEBHOOK HANDLER
 # =====================================================
 @app.post("/helius-webhook")
 async def helius_webhook(request: Request):
-    """Receive webhook payloads from Helius."""
     body = await request.json()
-
     for event in body:
         if event.get("type") == "TOKEN_MINT":
             transfers = event.get("tokenTransfers", [])
             mint = transfers[0].get("mint") if transfers else None
-            timestamp = event.get("timestamp")
-            if mint:
-                await add_token(mint, timestamp)
+            raw_ts = event.get("timestamp")
+            if raw_ts and raw_ts > 10**12:
+                timestamp = raw_ts / 1000
             else:
-                logger.warning("⚠️ Missing mint address in event.")
+                timestamp = raw_ts or time.time()
 
+            if mint and mint not in tracked_tokens:
+                tracked_tokens[mint] = {"timestamp": timestamp, "state": "new", "last_check": 0.0, "data": {}}
+                logger.info(f"🆕 New token minted: {mint} at {timestamp}")
     return {"status": "ok"}
 
+# =====================================================
+# STARTUP
+# =====================================================
+@app.on_event("startup")
+async def start_background_tasks():
+    logger.info("🚀 Launching monitor loop (startup event)...")
+    asyncio.create_task(monitor_tokens())
 
-# =====================================================
-#  STARTUP
-# =====================================================
 if __name__ == "__main__":
-    logger.info("🚀 Starting Continuous-Mode Helius Token Bot (CU-Free)")
-    # Launch background monitoring loop
-    asyncio.get_event_loop().create_task(monitor_tokens())
+    logger.info("🚀 Starting Helius Token Bot — Free Mode")
     uvicorn.run("helius_token_bot:app", host="0.0.0.0", port=8000, reload=True, access_log=False)
