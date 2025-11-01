@@ -111,16 +111,15 @@ deployer_rep = DeployerReputationManager()
 # =====================================================
 # MOONSCORE FUNCTION
 # =====================================================
-def calculate_moon_score(data: dict, deployer_score: float = 0.0) -> float:
+def calculate_moon_score(data: dict, deployer_score: float = 0.0):
     liquidity = float(data.get("liquidity_usd", 0))
-    holders = int(data.get("holder", 0))
     volume = float(data.get("volume_24h_usd", 0))
     price_change = float(data.get("price_change_1h", 0))
     whale_concentration = float(data.get("top10_holder_ratio", 0.85))
 
-    liquidity_score = min(liquidity / 5000, 1) * 20
+    liquidity_score = min(liquidity / 100000, 1) * 20
     holder_score = min(holders / 50, 1) * 15
-    volume_score = min(volume / 3000, 1) * 25
+    volume_score = min(volume / 200000, 1) * 25
     momentum_score = max(min(price_change / 20, 1), 0) * 10
     concentration_score = (1 - whale_concentration) * 20
     deployer_component = max(min(deployer_score, 1), -1) * 10
@@ -196,29 +195,83 @@ async def fetch_dexscreener_data(mint: str) -> dict:
     return result
 
 # =====================================================
-# BIRDEYE PUBLIC FALLBACK
+# BIRDEYE PREMIUM DATA SOURCE (SAFE VERSION)
 # =====================================================
-async def fetch_birdeye_public(mint: str) -> dict:
-    url = f"https://public-api.birdeye.so/public/defi/token_overview?address={mint}"
+async def fetch_birdeye_premium(mint: str) -> dict:
+    api_key = os.getenv("BIRDEYE_API_KEY", "")
+    if not api_key:
+        logger.warning("⚠️ No Birdeye API key found in environment!")
+        return {}
+
+    url = f"https://public-api.birdeye.so/defi/token_overview?address={mint}&chain=solana"
+    headers = {
+        "X-API-KEY": api_key,
+        "accept": "application/json"
+    }
+
     try:
-        data = await throttled_get(url)
+        data = await throttled_get(url, headers=headers)
     except Exception as e:
-        logger.warning(f"[{mint}] Birdeye public failed: {e}")
+        logger.warning(f"[{mint}] Birdeye premium failed: {e}")
         return {}
 
     info = data.get("data") if data else None
     if not info:
         return {}
 
+    # Helper for safe numeric conversion
+    def safe_float(value, default=0.0):
+        try:
+            return float(value) if value is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    def safe_int(value, default=0):
+        try:
+            return int(value) if value is not None else default
+        except (TypeError, ValueError):
+            return default
+
     return {
-        "symbol": info.get("symbol"),
-        "name": info.get("name"),
-        "liquidity_usd": float(info.get("liquidity", 0)),
-        "volume_24h_usd": float(info.get("volume_24h", 0)),
-        "price_usd": float(info.get("price", 0)),
-        "holder": int(info.get("holder", 0)),
-        "top10_holder_ratio": 0.85
+        "symbol": info.get("symbol") or "",
+        "name": info.get("name") or "",
+        "liquidity_usd": safe_float(info.get("liquidity")),
+        "volume_24h_usd": safe_float(info.get("volume_24h")),
+        "price_usd": safe_float(info.get("price")),
+        "holder": safe_int(info.get("holder")),
+        "top10_holder_ratio": safe_float(info.get("top10_holder_ratio"), 0.85),
     }
+
+# =====================================================
+# HELIUS DEPLOYER FETCHER (DAS FALLBACK)
+# =====================================================
+async def fetch_helius_deployer(mint: str) -> str:
+    helius_key = os.getenv("HELIUS_API_KEY", "")
+    if not helius_key:
+        return ""
+
+    url = f"https://mainnet.helius-rpc.com/?api-key={helius_key}"
+    payload = {
+        "jsonrpc": "2.0",
+        "id": "fetchDeployer",
+        "method": "getAsset",
+        "params": {"id": mint}
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as resp:
+                data = await resp.json()
+                authorities = data.get("result", {}).get("authorities", [])
+                if not authorities:
+                    return ""
+                deployer = authorities[0].get("address", "")
+                if deployer == "11111111111111111111111111111111":
+                    deployer = "renounced"
+                return deployer
+    except Exception as e:
+        logger.warning(f"[{mint}] Helius DAS deployer fetch failed: {e}")
+        return ""
 
 # =====================================================
 # COMBINED FETCHER
@@ -226,7 +279,15 @@ async def fetch_birdeye_public(mint: str) -> dict:
 async def fetch_token_data(mint: str) -> dict:
     data = await fetch_dexscreener_data(mint)
     if not data:
-        data = await fetch_birdeye_public(mint)
+        data = await fetch_birdeye_premium(mint)
+
+    if data:
+        deployer = await fetch_birdeye_deployer(mint)
+        if not deployer:
+            deployer = await fetch_helius_deployer(mint)
+        if deployer:
+            data["deployer"] = deployer
+
     return data
 
 # =====================================================
